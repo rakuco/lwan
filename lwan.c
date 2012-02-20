@@ -25,6 +25,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <pthread_np.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -470,11 +471,11 @@ _create_thread(lwan_t *l, int thread_n)
     }
 
     if (l->config.enable_thread_affinity) {
-        cpu_set_t cpuset;
+        cpuset_t cpuset;
 
         CPU_ZERO(&cpuset);
         CPU_SET(thread_n, &cpuset);
-        if (pthread_setaffinity_np(thread->id, sizeof(cpu_set_t), &cpuset)) {
+        if (pthread_setaffinity_np(thread->id, sizeof(cpuset_t), &cpuset)) {
             perror("pthread_setaffinity_np");
             exit(-1);
         }
