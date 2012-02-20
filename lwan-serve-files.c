@@ -18,15 +18,18 @@
  */
 
 #define _GNU_SOURCE
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sendfile.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "lwan.h"
@@ -89,7 +92,7 @@ _serve_file_stream(lwan_t* l, lwan_request_t *request, void *data)
         goto end_corked;
     }
 
-    if (UNLIKELY(sendfile(request->fd, file_fd, NULL, st.st_size) < 0))
+    if (UNLIKELY(sendfile(file_fd, request->fd, 0, st.st_size, NULL, NULL, 0) < 0))
         return_status = HTTP_INTERNAL_ERROR;
     else
         return_status = HTTP_OK;
