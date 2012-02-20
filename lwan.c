@@ -18,12 +18,21 @@
  */
 
 #define _GNU_SOURCE
+
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <pthread.h>
 #include <pthread_np.h>
 #include <setjmp.h>
@@ -31,12 +40,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/resource.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/uio.h>
 #include <unistd.h>
 
 #include "lwan.h"
@@ -339,24 +342,29 @@ static void *
 _thread(void *data)
 {
     lwan_thread_t *t = data;
-    struct epoll_event events[t->lwan->thread.max_fd];
-    int epoll_fd = t->epoll_fd, n_fds, i;
+    struct kevent events[t->lwan->thread.max_fd];
+    int kqueue_fd = t->kqueue_fd, n_fds, i;
     unsigned int death_time = 0;
 
     lwan_request_t *requests = t->lwan->requests;
     int *death_queue = calloc(1, t->lwan->thread.max_fd * sizeof(int));
     int death_queue_last = 0, death_queue_first = 0, death_queue_population = 0;
 
+    const struct timespec keep_alive_length = {
+        .tv_sec = 1,
+        .tv_nsec = 0
+    };
+
     for (; ; ) {
-        switch (n_fds = epoll_wait(epoll_fd, events, N_ELEMENTS(events),
-                                            death_queue_population ? 1000 : -1)) {
+        switch (n_fds = kevent(kqueue_fd, NULL, 0, events, N_ELEMENTS(events),
+                               death_queue_population ? &keep_alive_length : NULL)) {
         case -1:
             switch (errno) {
             case EBADF:
             case EINVAL:
-                goto epoll_fd_closed;
+                goto kqueue_fd_closed;
             case EINTR:
-                perror("epoll_wait");
+                perror("kevent");
             }
             continue;
         case 0: /* timeout: shutdown waiting sockets */
@@ -381,18 +389,19 @@ _thread(void *data)
             break;
         default: /* activity in some of this poller's file descriptor */
             for (i = 0; i < n_fds; ++i) {
-                lwan_request_t *request = &requests[events[i].data.fd];
+                lwan_request_t *request = &requests[events[i].ident];
 
-                if (events[i].events & (EPOLLRDHUP | EPOLLHUP)) {
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]) < 0)
-                        perror("epoll_ctl");
+                if (events[i].flags & EV_EOF) {
+                    struct kevent ev;
+                    EV_SET(&ev, events[i].ident, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                    kevent(kqueue_fd, &ev, 1, NULL, 0, NULL);
                     goto invalidate_request;
                 }
 
                 if (!request->flags.alive) {
                     /* Reset the whole thing. */
                     memset(request, 0, sizeof(*request));
-                    request->fd = events[i].data.fd;
+                    request->fd = events[i].ident;
                 }
 
                 /*
@@ -416,7 +425,7 @@ _thread(void *data)
                      * socket again. Or not. Mwahahaha.
                      */
                     if (!request->flags.alive) {
-                        death_queue[death_queue_last++] = events[i].data.fd;
+                        death_queue[death_queue_last++] = events[i].ident;
                         ++death_queue_population;
                         death_queue_last %= t->lwan->thread.max_fd;
                         request->flags.alive = true;
@@ -424,14 +433,14 @@ _thread(void *data)
                     continue;
                 }
 
-                close(events[i].data.fd);
+                close(events[i].ident);
 invalidate_request:
                 request->flags.alive = false;
             }
         }
     }
 
-epoll_fd_closed:
+kqueue_fd_closed:
     free(death_queue);
 
     return NULL;
@@ -444,8 +453,8 @@ _create_thread(lwan_t *l, int thread_n)
     lwan_thread_t *thread = &l->thread.threads[thread_n];
 
     thread->lwan = l;
-    if ((thread->epoll_fd = epoll_create1(0)) < 0) {
-        perror("epoll_create");
+    if ((thread->kqueue_fd = kqueue()) < 0) {
+        perror("kqueue (_create_thread)");
         exit(-1);
     }
 
@@ -511,7 +520,7 @@ _thread_shutdown(lwan_t *l)
      * finalized.
      */
     for (i = l->thread.count - 1; i >= 0; i--)
-        close(l->thread.threads[i].epoll_fd);
+        close(l->thread.threads[i].kqueue_fd);
     for (i = l->thread.count - 1; i >= 0; i--)
         pthread_join(l->thread.threads[i].id, NULL);
 
@@ -719,14 +728,13 @@ _schedule_request(lwan_t *l)
 ALWAYS_INLINE static void
 _push_request_fd(lwan_t *l, int fd)
 {
-    int epoll_fd = l->thread.threads[_schedule_request(l)].epoll_fd;
-    struct epoll_event event = {
-        .events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLET,
-        .data.fd = fd
-    };
+    int kqueue_fd = l->thread.threads[_schedule_request(l)].kqueue_fd;
+    struct kevent event;
 
-    if (UNLIKELY(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0)) {
-        perror("epoll_ctl");
+    EV_SET(&event, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, l->thread.count * l->thread.max_fd, NULL);
+
+    if (UNLIKELY(kevent(kqueue_fd, &event, 1, NULL, 0, NULL) < 0)) {
+        perror("kevent");
         exit(-1);
     }
 }
@@ -746,29 +754,35 @@ lwan_main_loop(lwan_t *l)
 
     signal(SIGINT, _cleanup);
 
-    int epoll_fd = epoll_create1(0);
-    struct epoll_event events[128];
-    struct epoll_event ev = {
-        .events = EPOLLIN,
-    };
-
     if (fcntl(l->main_socket, F_SETFL, O_NONBLOCK) < 0) {
         perror("fcntl: main socket");
         exit(-1);
     }
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, l->main_socket, &ev) < 0) {
-        perror("epoll_ctl");
-        exit(-1);
+
+    int kqueue_fd = kqueue();
+    if (kqueue_fd < 0) {
+        perror("kqueue");
+        return;
     }
+
+    struct kevent events[128];
+    struct kevent ev;
+
+    EV_SET(&ev, l->main_socket, EVFILT_READ, EV_ADD, 0, l->thread.count * l->thread.max_fd, NULL);
 
     for (;;) {
         int n_fds;
-        for (n_fds = epoll_wait(epoll_fd, events, N_ELEMENTS(events), -1);
+        for (n_fds = kevent(kqueue_fd, &ev, 1, events, N_ELEMENTS(events), NULL);
                 n_fds > 0;
                 --n_fds) {
-            int child_fd = accept4(l->main_socket, NULL, NULL, SOCK_NONBLOCK);
+            int child_fd = accept(l->main_socket, NULL, NULL);
             if (UNLIKELY(child_fd < 0)) {
                 perror("accept");
+                continue;
+            }
+            if (UNLIKELY(fcntl(child_fd, F_SETFL, O_NONBLOCK) < 0)) {
+                perror("fnctl");
+                close(child_fd);
                 continue;
             }
 
@@ -776,7 +790,7 @@ lwan_main_loop(lwan_t *l)
         }
     }
 
-    close(epoll_fd);
+    close(kqueue_fd);
 }
 
 int

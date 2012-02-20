@@ -143,7 +143,7 @@ struct lwan_url_map_t_ {
 
 struct lwan_thread_t_ {
     lwan_t *lwan;
-    int epoll_fd;
+    int kqueue_fd;
     pthread_t id;
 };
 
