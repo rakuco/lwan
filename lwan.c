@@ -63,7 +63,7 @@ static jmp_buf cleanup_jmp_buf;
 void
 lwan_request_set_corked(lwan_request_t *request, bool setting)
 {
-    if (UNLIKELY(setsockopt(request->fd, IPPROTO_TCP, TCP_CORK,
+    if (UNLIKELY(setsockopt(request->fd, IPPROTO_TCP, TCP_NOPUSH,
                         (int[]){ setting }, sizeof(int)) < 0))
         perror("setsockopt");
 }
